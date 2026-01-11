@@ -19,16 +19,12 @@ env:
 phases:
   pre_build:
     commands:
-      - echo "Installing AWS CLI v2..."
-      - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-      - unzip awscliv2.zip
-      - sudo ./aws/install
-      - aws --version
       - echo "Starting Blue/Green deployment..."
       - echo "GREEN_MAIN_ASG=$GREEN_MAIN_ASG"
       - echo "BLUE_MAIN_ASG=$BLUE_MAIN_ASG"
       - echo "GREEN_FACULTY_ASG=$GREEN_FACULTY_ASG"
       - echo "BLUE_FACULTY_ASG=$BLUE_FACULTY_ASG"
+
       - |
         if [ -z "$GREEN_MAIN_ASG" ] || [ -z "$BLUE_MAIN_ASG" ]; then
           echo "ERROR: ASG names not set!"
