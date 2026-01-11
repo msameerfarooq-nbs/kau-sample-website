@@ -12,44 +12,65 @@ env:
 phases:
   pre_build:
     commands:
-      - echo "Logging into ECR..."
-      - aws ecr get-login-password --region $AWS_DEFAULT_REGION \
-        | docker login --username AWS --password-stdin \
-        $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - echo "======================"
+      - echo "Pre-build phase started on $(date)"
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
 
+      - echo "Preparing repository URI..."
       - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME
+      - echo "Extracting repository name from ECR URI..."
+      - ACTUAL_REPO_NAME=$(echo $IMAGE_URI | cut -d'/' -f2)
+      - echo "Actual repository name is $ACTUAL_REPO_NAME"
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ACTUAL_REPO_NAME
+      - echo "Repository URI: $REPOSITORY_URI"
 
-      # Get commit hash for tagging
+      - echo "Getting commit hash and preparing image tags..."
       - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
       - IMAGE_TAG=${COMMIT_HASH:=latest}
+      - echo "Image tag for commit: $IMAGE_TAG"
 
-      # Calculate new version
+      - echo "Fetching current version from SSM..."
       - CURRENT_VERSION=$(aws ssm get-parameter --name $VERSION_PARAMETER_NAME --query 'Parameter.Value' --output text)
+      - echo "Current version: $CURRENT_VERSION"
+
+      - echo "Parsing version components..."
       - MAJOR=$(echo $CURRENT_VERSION | cut -d'.' -f1)
       - MINOR=$(echo $CURRENT_VERSION | cut -d'.' -f2)
       - PATCH=$(echo $CURRENT_VERSION | cut -d'.' -f3)
-      - NEW_VERSION="$MAJOR.$MINOR.$((PATCH+1))"
+      - NEW_PATCH=$((PATCH + 1))
+      - NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
+      - echo "New version will be $NEW_VERSION"
       - VERSION_TAG="v$NEW_VERSION"
+      - echo "New version tag: $VERSION_TAG"
 
   build:
     commands:
+      - echo "======================"
+      - echo "Build phase started on $(date)"
       - echo "Building Docker image..."
       - docker build -t $IMAGE_REPO_NAME:latest --build-arg APP_ENV=$APP_ENV .
+      - echo "Tagging Docker images..."
       - docker tag $IMAGE_REPO_NAME:latest $REPOSITORY_URI:latest
       - docker tag $IMAGE_REPO_NAME:latest $REPOSITORY_URI:$IMAGE_TAG
       - docker tag $IMAGE_REPO_NAME:latest $REPOSITORY_URI:$VERSION_TAG
+      - echo "Docker image build completed."
 
   post_build:
     commands:
-      - echo "Pushing Docker images..."
+      - echo "======================"
+      - echo "Post-build phase started on $(date)"
+      - echo "Pushing Docker images to ECR..."
       - docker push $REPOSITORY_URI:latest
       - docker push $REPOSITORY_URI:$IMAGE_TAG
       - docker push $REPOSITORY_URI:$VERSION_TAG
+      - echo "Docker images pushed successfully."
 
-      # Update SSM version
+      - echo "Updating version parameter in SSM..."
       - aws ssm put-parameter --name $VERSION_PARAMETER_NAME --value $NEW_VERSION --overwrite
+      - echo "SSM parameter updated to $NEW_VERSION."
 
-      # Generate image definitions for ECS
+      - echo "Writing imagedefinitions.json for ECS/CodeDeploy..."
       - printf '[{"name":"laravel-app","imageUri":"%s"}]' $REPOSITORY_URI:$VERSION_TAG > imagedefinitions.json
 
 artifacts:
