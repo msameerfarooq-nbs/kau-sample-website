@@ -1,20 +1,20 @@
 version: 0.2
 
-env:
-  variables:
-    # ASGs
-    GREEN_MAIN_ASG: "main-green-asg"
-    GREEN_FACULTY_ASG: "faculty-green-asg"
-    BLUE_MAIN_ASG: "main-blue-asg"
-    BLUE_FACULTY_ASG: "faculty-blue-asg"
+# env:
+#   variables:
+#     # ASGs
+#     GREEN_MAIN_ASG: "main-green-asg"
+#     GREEN_FACULTY_ASG: "faculty-green-asg"
+#     BLUE_MAIN_ASG: "main-blue-asg"
+#     BLUE_FACULTY_ASG: "faculty-blue-asg"
 
-    # ALB rules
-    MAIN_RULE_ARN: ""
-    FACULTY_RULE_ARN: ""
+#     # ALB rules
+#     MAIN_RULE_ARN: ""
+#     FACULTY_RULE_ARN: ""
 
-    # Target groups
-    MAIN_GREEN_TG: ""
-    FACULTY_GREEN_TG: ""
+#     # Target groups
+#     MAIN_GREEN_TG: ""
+#     FACULTY_GREEN_TG: ""
 
 phases:
   pre_build:
@@ -38,8 +38,39 @@ phases:
       - aws autoscaling update-auto-scaling-group --auto-scaling-group-name $GREEN_FACULTY_ASG --desired-capacity 1
 
       - echo "Waiting for GREEN ASGs to be in service..."
-      - aws autoscaling wait group-in-service --auto-scaling-group-names $GREEN_MAIN_ASG
-      - aws autoscaling wait group-in-service --auto-scaling-group-names $GREEN_FACULTY_ASG
+      # - aws autoscaling wait group-in-service --auto-scaling-group-names $GREEN_MAIN_ASG
+      # - aws autoscaling wait group-in-service --auto-scaling-group-names $GREEN_FACULTY_ASG
+      - |
+        echo "Waiting for GREEN MAIN ASG instances to be InService..."
+        while true; do
+          COUNT=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$GREEN_MAIN_ASG" \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService' && HealthStatus=='Healthy'] | length(@)" \
+            --output text)
+          if [ "$COUNT" -ge 1 ]; then
+            echo "GREEN MAIN ASG ready"
+            break
+          fi
+          echo "Waiting..."
+          sleep 20
+        done
+
+      - |
+        echo "Waiting for GREEN FACULTY ASG instances to be InService..."
+        while true; do
+          COUNT=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$GREEN_FACULTY_ASG" \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService' && HealthStatus=='Healthy'] | length(@)" \
+            --output text)
+          if [ "$COUNT" -ge 1 ]; then
+            echo "GREEN FACULTY ASG ready"
+            break
+          fi
+          echo "Waiting..."
+          sleep 20
+        done
+
+
 
       - echo "Switching ALB rules to GREEN target groups..."
       - aws elbv2 modify-rule --rule-arn $MAIN_RULE_ARN --actions Type=forward,TargetGroupArn=$MAIN_GREEN_TG
