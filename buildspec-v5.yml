@@ -1,0 +1,86 @@
+version: 0.2
+
+env:
+  variables:
+    DOCKER_BUILDKIT: 1
+    COMPOSE_DOCKER_CLI_BUILD: 1
+
+    IMAGE_REPO_NAME: "laravel-app"
+    APP_ENV: "dev"
+    VERSION_PARAMETER_NAME: "/laravel-app/dev/version"
+
+    # -------------------------
+    # ALB + Blue/Green Switching
+    # -------------------------
+    MAIN_GREEN_TG: "arn:aws:elasticloadbalancing:REGION:ACCOUNT:targetgroup/main-green/xxxx"
+    FACULTY_GREEN_TG: "arn:aws:elasticloadbalancing:REGION:ACCOUNT:targetgroup/faculty-green/xxxx"
+
+    MAIN_HTTP_RULE_ARN: "arn:aws:elasticloadbalancing:REGION:ACCOUNT:listener-rule/main-http"
+    FAC_HTTP_RULE_ARN: "arn:aws:elasticloadbalancing:REGION:ACCOUNT:listener-rule/fac-http"
+
+    MAIN_HTTPS_RULE_ARN: "arn:aws:elasticloadbalancing:REGION:ACCOUNT:listener-rule/main-https"
+    FAC_HTTPS_RULE_ARN: "arn:aws:elasticloadbalancing:REGION:ACCOUNT:listener-rule/fac-https"
+
+    GREEN_MAIN_ASG: "main-green-asg"
+    GREEN_FACULTY_ASG: "faculty-green-asg"
+    BLUE_MAIN_ASG: "main-blue-asg"
+    BLUE_FACULTY_ASG: "faculty-blue-asg"
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging into ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION \
+        | docker login --username AWS --password-stdin \
+        $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME
+
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+
+      - CURRENT_VERSION=$(aws ssm get-parameter --name $VERSION_PARAMETER_NAME --query 'Parameter.Value' --output text)
+      - MAJOR=$(echo $CURRENT_VERSION | cut -d'.' -f1)
+      - MINOR=$(echo $CURRENT_VERSION | cut -d'.' -f2)
+      - PATCH=$(echo $CURRENT_VERSION | cut -d'.' -f3)
+      - NEW_VERSION="$MAJOR.$MINOR.$((PATCH+1))"
+      - VERSION_TAG="v$NEW_VERSION"
+
+  build:
+    commands:
+      - docker build -t $IMAGE_REPO_NAME:latest --build-arg APP_ENV=$APP_ENV .
+      - docker tag $IMAGE_REPO_NAME:latest $REPOSITORY_URI:latest
+      - docker tag $IMAGE_REPO_NAME:latest $REPOSITORY_URI:$IMAGE_TAG
+      - docker tag $IMAGE_REPO_NAME:latest $REPOSITORY_URI:$VERSION_TAG
+
+  post_build:
+    commands:
+      - docker push $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - docker push $REPOSITORY_URI:$VERSION_TAG
+
+      - aws ssm put-parameter --name $VERSION_PARAMETER_NAME --value $NEW_VERSION --overwrite
+
+      - printf '[{"name":"laravel-app","imageUri":"%s"}]' $REPOSITORY_URI:$VERSION_TAG > imagedefinitions.json
+
+      # -------------------------
+      # Blue → Green Switch
+      # -------------------------
+      - aws autoscaling update-auto-scaling-group --auto-scaling-group-name $GREEN_MAIN_ASG --desired-capacity 1
+      - aws autoscaling update-auto-scaling-group --auto-scaling-group-name $GREEN_FACULTY_ASG --desired-capacity 1
+
+      - aws autoscaling wait group-in-service --auto-scaling-group-names $GREEN_MAIN_ASG
+      - aws autoscaling wait group-in-service --auto-scaling-group-names $GREEN_FACULTY_ASG
+
+      - aws elbv2 modify-rule --rule-arn $MAIN_HTTP_RULE_ARN --actions Type=forward,TargetGroupArn=$MAIN_GREEN_TG
+      - aws elbv2 modify-rule --rule-arn $FAC_HTTP_RULE_ARN --actions Type=forward,TargetGroupArn=$FACULTY_GREEN_TG
+
+      - aws elbv2 modify-rule --rule-arn $MAIN_HTTPS_RULE_ARN --actions Type=forward,TargetGroupArn=$MAIN_GREEN_TG
+      - aws elbv2 modify-rule --rule-arn $FAC_HTTPS_RULE_ARN --actions Type=forward,TargetGroupArn=$FACULTY_GREEN_TG
+
+      - aws autoscaling update-auto-scaling-group --auto-scaling-group-name $BLUE_MAIN_ASG --desired-capacity 0
+      - aws autoscaling update-auto-scaling-group --auto-scaling-group-name $BLUE_FACULTY_ASG --desired-capacity 0
+
+artifacts:
+  files:
+    - imagedefinitions.json
