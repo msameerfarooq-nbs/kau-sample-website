@@ -1,0 +1,526 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECR Repository and CodePipeline/CodeBuild for Laravel Application CI/CD'
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: kau
+    Description: Name of the application
+    MinLength: 1
+  
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name
+  
+  RepositoryUrl:
+    Type: String
+    Description: Full repository URL (e.g., https://github.com/owner/repo or https://bitbucket.org/owner/repo)
+    MinLength: 1
+    AllowedPattern: '^https://(github\.com|bitbucket\.org|gitlab\.com)/[^/]+/[^/]+/?$'
+    ConstraintDescription: Must be a valid GitHub, Bitbucket, or GitLab repository URL
+  
+  RepoBranch:
+    Type: String
+    Default: main
+    Description: Branch to trigger CodePipeline (e.g., 'main')
+    MinLength: 1
+  
+  RepoConnectionArn:
+    Type: String
+    Description: ARN of the existing CodeStar Connection to Repository (works with GitHub, Bitbucket, GitLab)
+    MinLength: 1
+    Default: arn:aws:codeconnections:eu-west-1:972841066890:connection/dbb60712-18ca-445b-a90a-ba77fd454072
+  ArtifactKmsKeyArn:
+    Type: String
+    Default: alias/aws/s3
+
+  MainRuleArn:
+    Type: String
+
+  FacultyRuleArn:
+    Type: String
+
+  MainGreenTargetGroupArn:
+    Type: String
+
+  FacultyGreenTargetGroupArn:
+    Type: String
+
+  GreenMainASG:
+    Type: String
+
+  GreenFacultyASG:
+    Type: String
+
+  BlueMainASG:
+    Type: String
+
+  BlueFacultyASG:
+    Type: String
+
+  BuildSpecFilePath:
+    Type: String
+    Description: Path to the buildspec file in the repository
+    Default: buildspec.yml
+  
+  DeployBuildSpecFilePath:
+    Type: String
+    Default: buildspec-deploy-bluegreen.yml
+    Description: Path to the deploy buildspec file in the repository
+
+
+  CodeBuildImage:
+    Type: String
+    Description: CodeBuild environment image
+    Default: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+  
+  CodeBuildComputeType:
+    Type: String
+    Description: CodeBuild compute type
+    Default: BUILD_GENERAL1_MEDIUM
+    AllowedValues:
+      - BUILD_GENERAL1_SMALL
+      - BUILD_GENERAL1_MEDIUM
+      - BUILD_GENERAL1_LARGE
+      - BUILD_GENERAL1_2XLARGE
+  
+  TriggerPath:
+    Type: String
+    Description: Path in the repository to trigger the pipeline
+    Default: "**"
+  
+
+
+Resources:
+  # SSM Parameter for version tracking
+  VersionParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ApplicationName}/${Environment}/version'
+      Type: String
+      Value: '1.0.0'
+      Description: !Sub 'Current version for ${ApplicationName} ${Environment}'
+      Tags:
+        Application: !Ref ApplicationName
+        Environment: !Ref Environment
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ApplicationName}-${Environment}-ecr-repo'
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 production images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep last 5 untagged images",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  # S3 Bucket for CodePipeline artifacts
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ApplicationName}-${Environment}-pipeline-artifacts-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # CodeBuild Service Role
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildLaravelPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${ArtifactsBucket.Arn}'
+                  - !Sub '${ArtifactsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApplicationName}/${Environment}/version'
+              - Effect: Allow
+                Action:
+                  - codeconnections:UseConnection
+                  - codeconnections:GetConnectionToken
+                Resource: !Ref RepoConnectionArn
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:DescribeKey
+                  - kms:GenerateDataKey
+                  - kms:ReEncrypt*
+                Resource: 
+                  - !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                  - !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:alias/*'
+      RoleName: !Sub '${ApplicationName}-${Environment}-codebuild-role'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CodePipeline Service Role
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineLaravelPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codeconnections:UseConnection
+                  - codeconnections:GetConnectionToken
+                Resource: !Ref RepoConnectionArn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${ArtifactsBucket.Arn}'
+                  - !Sub '${ArtifactsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:DescribeKey
+                  - kms:GenerateDataKey
+                  - kms:ReEncrypt*
+                Resource: 
+                  - !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                  - !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:alias/*'
+      RoleName: !Sub '${ApplicationName}-${Environment}-codepipeline-role'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CodeBuild Project
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-codebuild'
+      Description: !Sub 'Build project for ${ApplicationName} ${Environment}'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref CodeBuildComputeType
+        Image: !Ref CodeBuildImage
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: IMAGE_REPO_NAME
+            Value: !Ref ECRRepository
+          - Name: IMAGE_URI
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+          - Name: APP_ENV
+            Value: !Ref Environment
+          - Name: VERSION_PARAMETER_NAME
+            Value: !Sub '/${ApplicationName}/${Environment}/version'
+          - Name: DEPLOY_BUILDSPEC_FILE      # <-- NEW
+            Value: !Ref DeployBuildSpecFilePath
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Ref BuildSpecFilePath
+      TimeoutInMinutes: 60
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-deploy-bluegreen'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: MAIN_RULE_ARN
+            Value: !Ref MainRuleArn
+          - Name: FACULTY_RULE_ARN
+            Value: !Ref FacultyRuleArn
+          - Name: MAIN_GREEN_TG
+            Value: !Ref MainGreenTargetGroupArn
+          - Name: FACULTY_GREEN_TG
+            Value: !Ref FacultyGreenTargetGroupArn
+          - Name: GREEN_MAIN_ASG
+            Value: !Ref GreenMainASG
+          - Name: GREEN_FACULTY_ASG
+            Value: !Ref GreenFacultyASG
+          - Name: BLUE_MAIN_ASG
+            Value: !Ref BlueMainASG
+          - Name: BLUE_FACULTY_ASG
+            Value: !Ref BlueFacultyASG
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+       # BuildSpec: buildspec-deploy-bluegreen.yml
+        BuildSpec: !Ref DeployBuildSpecFilePath
+
+
+
+
+  # CodePipeline
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-codepipeline'
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+        EncryptionKey:
+          Type: KMS
+          Id: !Ref ArtifactKmsKeyArn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref RepoConnectionArn
+                # Extract owner/repo from URL: https://github.com/owner/repo -> owner/repo
+                FullRepositoryId: !Join ['/', [!Select [3, !Split ['/', !Ref RepositoryUrl]], !Select [4, !Split ['/', !Ref RepositoryUrl]]]]
+                BranchName: !Ref RepoBranch
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts:
+                - Name: source-artifact
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+                EnvironmentVariables: !Sub |
+                  [
+                    {
+                      "name": "IMAGE_URI",
+                      "value": "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}"
+                    },
+                    {
+                      "name": "VERSION_PARAMETER_NAME",
+                      "value": "/${ApplicationName}/${Environment}/version"
+                    },
+                    {
+                      "name": "APP_ENV",
+                      "value": "${Environment}"
+                    }
+                  ]
+              InputArtifacts:
+                - Name: source-artifact
+              OutputArtifacts:
+                - Name: build-artifact
+        - Name: Approval
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: "Approve Blue → Green traffic switch"
+
+        - Name: Deploy
+          Actions:
+            - Name: DeployGreen
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DeployProject
+              InputArtifacts:
+                - Name: build-artifact
+
+
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: SourceAction
+            Push:
+              - Branches:
+                  Includes:
+                    - !Ref RepoBranch
+                FilePaths:
+                  Includes:
+                    - !Ref TriggerPath
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+Outputs:
+  PipelineName:
+    Description: Name of the CodePipeline
+    Value: !Sub '${ApplicationName}-${Environment}-codepipeline'
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-Pipeline-Name'
+  
+  BuildProjectName:
+    Description: Name of the CodeBuild project
+    Value: !Sub '${ApplicationName}-${Environment}-codebuild'
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-Build-Project-Name'
+  
+  BuildProjectArn:
+    Description: ARN of the CodeBuild project
+    Value: !GetAtt CodeBuildProject.Arn
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-Build-Project-Arn'
+  
+  ArtifactsBucketName:
+    Description: Name of the S3 bucket for pipeline artifacts
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-Artifacts-Bucket'
+  
+  CodeBuildRoleArn:
+    Description: ARN of the CodeBuild service role
+    Value: !GetAtt CodeBuildRole.Arn
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-CodeBuild-Role-Arn'
+  
+  CodePipelineRoleArn:
+    Description: ARN of the CodePipeline service role
+    Value: !GetAtt CodePipelineRole.Arn
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-CodePipeline-Role-Arn'
+  
+  RepoConnectionArn:
+    Description: Repository Connection ARN used for source integration
+    Value: !Ref RepoConnectionArn
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-Repo-Connection-Arn'
+  
+  RepositoryUrl:
+    Description: Repository URL used for source integration
+    Value: !Ref RepositoryUrl
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-Repository-Url'
+  
+  RepositoryId:
+    Description: Extracted Repository ID (owner/repo format)
+    Value: !Join ['/', [!Select [3, !Split ['/', !Ref RepositoryUrl]], !Select [4, !Split ['/', !Ref RepositoryUrl]]]]
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-Repository-Id'
+  
+  ECRRepositoryURI:
+    Description: ECR Repository URI
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-ECR-URI'
+  
+  ECRRepositoryName:
+    Description: ECR Repository Name
+    Value: !Ref ECRRepository
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-ECR-Name'
