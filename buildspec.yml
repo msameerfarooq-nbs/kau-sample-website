@@ -65,6 +65,7 @@ phases:
 artifacts:
   files:
     - imagedefinitions.json
+    - $DEPLOY_BUILDSPEC_FILE   # <-- dynamic now, uses env var
   name: laravel-build-artifacts
 
 cache:
