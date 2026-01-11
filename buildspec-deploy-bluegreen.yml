@@ -76,6 +76,14 @@ phases:
       - aws elbv2 modify-rule --rule-arn $MAIN_RULE_ARN --actions Type=forward,TargetGroupArn=$MAIN_GREEN_TG
       - aws elbv2 modify-rule --rule-arn $FACULTY_RULE_ARN --actions Type=forward,TargetGroupArn=$FACULTY_GREEN_TG
 
+      # - echo "Scaling down BLUE ASGs..."
+      # - aws autoscaling update-auto-scaling-group --auto-scaling-group-name $BLUE_MAIN_ASG --desired-capacity 0
+      # - aws autoscaling update-auto-scaling-group --auto-scaling-group-name $BLUE_FACULTY_ASG --desired-capacity 0
+
+      - echo "Lowering BLUE ASG min size..."
+      - aws autoscaling update-auto-scaling-group --auto-scaling-group-name $BLUE_MAIN_ASG --min-size 0
+      - aws autoscaling update-auto-scaling-group --auto-scaling-group-name $BLUE_FACULTY_ASG --min-size 0
+
       - echo "Scaling down BLUE ASGs..."
       - aws autoscaling update-auto-scaling-group --auto-scaling-group-name $BLUE_MAIN_ASG --desired-capacity 0
       - aws autoscaling update-auto-scaling-group --auto-scaling-group-name $BLUE_FACULTY_ASG --desired-capacity 0
