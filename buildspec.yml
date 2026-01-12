@@ -1,30 +1,12 @@
 version: 0.2
 
 phases:
-  install:
-    runtime-versions:
-      python: 3.11   # change if needed
-    commands:
-      - echo "Install phase started"
-      - yum install -y zip
-
-  pre_build:
-    commands:
-      - echo "Pre-build phase"
-      - echo "Nothing much here"
-
   build:
     commands:
-      - echo "Build phase"
-      - echo "Zipping application"
-      - zip -r app.zip . -x "*.git*"
-
-  post_build:
-    commands:
-      - echo "Build completed successfully"
+      - echo "Hello from CodeBuild"
+      - echo "test success" > test.txt
 
 artifacts:
   files:
-    - app.zip
+    - test.txt
     - appspec.yml
-    - scripts/**/*
